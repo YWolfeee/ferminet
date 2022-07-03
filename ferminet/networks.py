@@ -681,6 +681,9 @@ def fermi_net(
     and log absolute of the network evaluated at x.
   """
 
+  ''' YWolfeee (Jul/02)
+    orbitals[0] has shape (det * n * n), where det is the number of determinants, n is the number of electrons.
+  '''
   orbitals, (ae, r_ae, r_ee) = fermi_net_orbitals(
       params,
       pos,

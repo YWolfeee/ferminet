@@ -232,6 +232,10 @@ def make_mcmc_step(batch_network,
 
     nelec = data.shape[-1] // 3
     nsteps = nelec * steps if one_electron_moves else steps
+    ''' YWolfeee (Jul/02)
+      logprob is a vector with shape (batch_size,), each representing a the probability
+    '''
+
     logprob = 2. * batch_network(params, data)
     data, key, _, num_accepts = lax.fori_loop(0, nsteps, step_fn,
                                               (data, key, logprob, 0.))
