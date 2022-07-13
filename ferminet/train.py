@@ -24,6 +24,7 @@ import chex
 from ferminet import checkpoint
 from ferminet import constants
 from ferminet import curvature_tags_and_blocks
+from ferminet import envelopes
 from ferminet import hamiltonian
 from ferminet import loss as qmc_loss_functions
 from ferminet import mcmc
@@ -162,6 +163,47 @@ class Step(Protocol):
     """
 
 
+def null_update(params: networks.ParamTree, data: jnp.ndarray,
+                opt_state: Optional[optax.OptState],
+                key: chex.PRNGKey) -> OptUpdateResults:
+  """Performs an identity operation with an OptUpdate interface."""
+  del data, key
+  return params, opt_state, jnp.zeros(1), None
+
+
+def make_opt_update_step(evaluate_loss: qmc_loss_functions.LossFn,
+                         optimizer: optax.GradientTransformation) -> OptUpdate:
+  """Returns an OptUpdate function for performing a parameter update."""
+
+  # Differentiate wrt parameters (argument 0)
+  loss_and_grad = jax.value_and_grad(evaluate_loss, argnums=0, has_aux=True)
+
+  def opt_update(params: networks.ParamTree, data: jnp.ndarray,
+                 opt_state: Optional[optax.OptState],
+                 key: chex.PRNGKey) -> OptUpdateResults:
+    """Evaluates the loss and gradients and updates the parameters using optax."""
+    (loss, aux_data), grad = loss_and_grad(params, key, data)
+    grad = constants.pmean(grad)
+    updates, opt_state = optimizer.update(grad, opt_state, params)
+    params = optax.apply_updates(params, updates)
+    return params, opt_state, loss, aux_data
+
+  return opt_update
+
+
+def make_loss_step(evaluate_loss: qmc_loss_functions.LossFn) -> OptUpdate:
+  """Returns an OptUpdate function for evaluating the loss."""
+
+  def loss_eval(params: networks.ParamTree, data: Tuple[jnp.ndarray, ...],
+                opt_state: Optional[optax.OptState],
+                key: chex.PRNGKey) -> OptUpdateResults:
+    """Evaluates just the loss and gradients with an OptUpdate interface."""
+    loss, aux_data = evaluate_loss(params, key, data)
+    return params, opt_state, loss, aux_data
+
+  return loss_eval
+
+
 def make_training_step(
     mcmc_step,
     optimizer_step: OptUpdate,
@@ -178,7 +220,7 @@ def make_training_step(
     step, a callable which performs a set of MCMC steps and then an optimization
     update. See the Step protocol for details.
   """
-  @functools.partial(constants.pmap, donate_argnums=(1, 2, 3, 4))
+  @functools.partial(constants.pmap, donate_argnums=(0, 1, 2))
   def step(data: jnp.ndarray,
            params: networks.ParamTree, state: Optional[optax.OptState],
            key: chex.PRNGKey, mcmc_width: jnp.ndarray) -> StepResults:
@@ -257,8 +299,8 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
                'across %i hosts.', num_devices, num_hosts)
   if cfg.batch_size % (num_devices * num_hosts) != 0:
     raise ValueError('Batch size must be divisible by number of devices, '
-                     'got batch size {} for {} devices.'.format(
-                         cfg.batch_size, num_devices * num_hosts))
+                     f'got batch size {cfg.batch_size} for '
+                     f'{num_devices * num_hosts} devices.')
   if cfg.system.ndim != 3:
     # The network (at least the input feature construction) and initial MCMC
     # molecule configuration (via system.Atom) assume 3D systems. This can be
@@ -302,12 +344,39 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
     ])
 
   hf_solution = hartree_fock if cfg.pretrain.method == 'direct_init' else None
+
+  if cfg.network.make_feature_layer_fn:
+    feature_layer_module, feature_layer_fn = (
+        cfg.network.make_feature_layer_fn.rsplit('.', maxsplit=1))
+    feature_layer_module = importlib.import_module(feature_layer_module)
+    make_feature_layer = getattr(feature_layer_module, feature_layer_fn)
+    feature_layer = make_feature_layer(
+        charges,
+        cfg.system.electrons,
+        cfg.system.ndim,
+        **cfg.network.make_feature_layer_kwargs)  # type: networks.FeatureLayer
+  else:
+    feature_layer = networks.make_ferminet_features(
+        charges,
+        cfg.system.electrons,
+        cfg.system.ndim,
+    )
+
+  if cfg.network.make_envelope_fn:
+    envelope_module, envelope_fn = (
+        cfg.network.make_envelope_fn.rsplit('.', maxsplit=1))
+    envelope_module = importlib.import_module(envelope_module)
+    make_envelope = getattr(envelope_module, envelope_fn)
+    envelope = make_envelope(**cfg.network.make_envelope_kwargs)  # type: envelopes.Envelope
+  else:
+    envelope = envelopes.make_isotropic_envelope()
+
   network_init, signed_network, network_options = networks.make_fermi_net(
       atoms,
       nspins,
       charges,
-      envelope=cfg.network.envelope_type,
-      feature_layer=cfg.network.get('feature_layer', 'standard'),
+      envelope=envelope,
+      feature_layer=feature_layer,
       bias_orbitals=cfg.network.bias_orbitals,
       use_last_layer=cfg.network.use_last_layer,
       hf_solution=hf_solution,
@@ -421,7 +490,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         charges=charges,
         nspins=nspins,
         use_scan=False)
-  total_energy = qmc_loss_functions.make_loss(
+  evaluate_loss = qmc_loss_functions.make_loss(
       network,
       local_energy,
       clip_local_energy=cfg.optim.clip_el)
@@ -429,8 +498,6 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
   def learning_rate_schedule(t_: jnp.ndarray) -> jnp.ndarray:
     return cfg.optim.lr.rate * jnp.power(
         (1.0 / (1.0 + (t_/cfg.optim.lr.delay))), cfg.optim.lr.decay)
-  # Differentiate wrt parameters (argument 0)
-  val_and_grad = jax.value_and_grad(total_energy, argnums=0, has_aux=True)
 
   # Construct and setup optimizer
   if cfg.optim.optimizer == 'none':
@@ -448,6 +515,8 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         optax.scale_by_schedule(learning_rate_schedule),
         optax.scale(-1))
   elif cfg.optim.optimizer == 'kfac':
+    # Differentiate wrt parameters (argument 0)
+    val_and_grad = jax.value_and_grad(evaluate_loss, argnums=0, has_aux=True)
     optimizer = kfac_jax.Optimizer(
         val_and_grad,
         l2_reg=cfg.optim.kfac.l2_reg,
@@ -476,31 +545,16 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
 
   if not optimizer:
     opt_state = None
-
-    def energy_eval(params: networks.ParamTree, data: jnp.ndarray,
-                    opt_state: Optional[optax.OptState],
-                    key: chex.PRNGKey) -> OptUpdateResults:
-      loss, aux_data = total_energy(params, key, data)
-      return params, opt_state, loss, aux_data
-
     step = make_training_step(
         mcmc_step=mcmc_step,
-        optimizer_step=energy_eval)
+        optimizer_step=make_loss_step(evaluate_loss))
   elif isinstance(optimizer, optax.GradientTransformation):
     # optax/optax-compatible optimizer (ADAM, LAMB, ...)
     opt_state = jax.pmap(optimizer.init)(params)
     opt_state = opt_state_ckpt or opt_state  # avoid overwriting ckpted state
-
-    def opt_update(params: networks.ParamTree, data: jnp.ndarray,
-                   opt_state: Optional[optax.OptState],
-                   key: chex.PRNGKey) -> OptUpdateResults:
-      (loss, aux_data), grad = val_and_grad(params, key, data)
-      grad = constants.pmean(grad)
-      updates, opt_state = optimizer.update(grad, opt_state, params)
-      params = optax.apply_updates(params, updates)
-      return params, opt_state, loss, aux_data
-
-    step = make_training_step(mcmc_step=mcmc_step, optimizer_step=opt_update)
+    step = make_training_step(
+        mcmc_step=mcmc_step,
+        optimizer_step=make_opt_update_step(evaluate_loss, optimizer))
   elif isinstance(optimizer, kfac_jax.Optimizer):
     step = make_kfac_training_step(
         mcmc_step=mcmc_step,
@@ -519,26 +573,20 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
   if t_init == 0:
     logging.info('Burning in MCMC chain for %d steps', cfg.mcmc.burn_in)
 
-    def null_update(params: networks.ParamTree, data: jnp.ndarray,
-                    opt_state: Optional[optax.OptState],
-                    key: chex.PRNGKey) -> OptUpdateResults:
-      del data, key
-      return params, opt_state, jnp.zeros(1), None
-
     burn_in_step = make_training_step(
         mcmc_step=mcmc_step, optimizer_step=null_update)
 
     for t in range(cfg.mcmc.burn_in):
       sharded_key, subkeys = kfac_jax.utils.p_split(sharded_key)
       data, params, *_ = burn_in_step(
-          data=data,
-          params=params,
+          data,
+          params,
           state=None,
           key=subkeys,
           mcmc_width=mcmc_width)
     logging.info('Completed burn-in MCMC steps')
     sharded_key, subkeys = kfac_jax.utils.p_split(sharded_key)
-    ptotal_energy = constants.pmap(total_energy)
+    ptotal_energy = constants.pmap(evaluate_loss)
     initial_energy, _ = ptotal_energy(params, subkeys, data)
     logging.info('Initial energy: %03.4f E_h', initial_energy[0])
 
@@ -566,11 +614,11 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
     for t in range(t_init, cfg.optim.iterations):
       sharded_key, subkeys = kfac_jax.utils.p_split(sharded_key)
       data, params, opt_state, loss, unused_aux_data, pmove = step(
-          data=data,
-          params=params,
-          state=opt_state,
-          key=subkeys,
-          mcmc_width=mcmc_width)
+          data,
+          params,
+          opt_state,
+          subkeys,
+          mcmc_width)
 
       # due to pmean, loss, and pmove should be the same across
       # devices.
