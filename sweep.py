@@ -1,7 +1,7 @@
 """""""""""""""""""""""""""""""""
     `sweep.py` by YWolfeee (Jul 15)
 
-    ## Decription ##
+    ## Description ##
     This function serves as a script to run multiple commands together and gather statistics.
     You need to write a basic command in a file, input changable args using the parser below. 
     This function will append your changable args input the basic command per run.
@@ -12,9 +12,13 @@
     ##
 
     ## Running Method ##
-    Notice that in order to make debugging easy, we don't use python module to run ferminet. Instead, standard python main.py command should be used.
+    Notice that in order to make debugging easy, we don't use python module to run ferminet. Instead, standard python main.py command should be used. To sweep an argument name `arg` with value `a,b,c`, please use `--loop.arg a b c`. For arguments that are not specified, the function will NOT sweep them.
     ##
+
+    ## Add New Args ##
+    Looping over a new argument is very easy in this implementation. Say the argument is `debug.new_arg`, and the value is `1,2,3`. You can first use add_argument and input `--loop.debug.new_arg`, and directly give `--loop.debug.new_arg 1 2 3 ` when you call this function.
 """""""""""""""""""""""""""""""""
+
 import os 
 import argparse
 import time
@@ -43,13 +47,14 @@ def getArgs():
 
     # changable args. We will loop over these args. Once appeared, it will overwrite the ferminet config.
     """
-        To add a new changable args, you can directly add an argument here. The function will automatically loop over them.
+        To add a new changable args, you can directly add an argument here. The function will automatically loop over them once you specify their choices. Remember to set default to empty list, since others might not want to loop over this argument.
         For example, if you want to loop over lr rate, you can add `--loop.optim.lr.rate`, set nargs to `+` and type to float.
+        The function use the prefix `loop` to specify whether this argument is for the ferminet program, or is directly used by this program. Please do not break this rule.
     """
 
-    parser.add_argument("--loop.batch_size", nargs = "+", type = int, default = [128, 256],
+    parser.add_argument("--loop.batch_size", nargs = "+", type = int, default = [],
                         help = "The batch_size list you want to loop over. Format should be like `--loop.batch_size 256 512 1024 2048 4096`.")
-    parser.add_argument("--loop.optim.iterations", nargs = "+", type = int, default = [10, 20],
+    parser.add_argument("--loop.optim.iterations", nargs = "+", type = int, default = [],
                         help = "Number of optimization steps.")
 
     args = parser.parse_args()
