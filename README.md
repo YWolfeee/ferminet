@@ -13,7 +13,7 @@ WARNING: This is a research-level release of a JAX implementation.
 ### Running method
 To make debugging easy, we gave up running program using python module. Instead, standard `python main.py` is supported. For example, one can run
 ```shell
-CUDA_VISIBLE_DEVICES=0 python -u main.py --config ferminet/configs/atom.py --config.system.atom Li  --config.pretrain.iterations 100
+python -u main.py --config ferminet/configs/atom.py --config.system.atom Li  --config.pretrain.iterations 100
 ```
 ### Sweep
 To make running efficient, args sweep is currently supported by `sweep.py`. For example, for the above training, you want to check the influence of batch_size and optimization steps. Assume you have two gpus with index `1,3`, and you can run each program in one gpu. In such case, you can first save the above command in `{your_base_dir}/script.sh`, and then run
