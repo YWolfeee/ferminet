@@ -278,8 +278,9 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
   charges = jnp.array([atom.charge for atom in cfg.system.molecule])
   nspins = cfg.system.electrons
 
-  if cfg.debug.deterministic:
-    seed = 23
+  # Change the way we obtain seed.
+  if cfg.debug.seed is not None:
+    seed = int(seed)
   else:
     seed = 1e6 * time.time()
     seed = int(multi_host.broadcast_to_hosts(seed))
@@ -607,6 +608,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
             energy=np.asarray(loss),
             ewmean=np.asarray(weighted_stats.mean),
             ewvar=np.asarray(weighted_stats.variance),
+            bth_var=np.asarray(unused_aux_data.variance),
             pmove=np.asarray(pmove))
 
       # Checkpointing

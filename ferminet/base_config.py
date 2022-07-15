@@ -183,7 +183,7 @@ def default() -> ml_collections.ConfigDict:
           # Check optimizer state, parameters and loss and raise an exception if
           # NaN is found.
           'check_nan': False,
-          'deterministic': False,  # Use a deterministic seed.
+          'seed': None,   # If none, seed is selected randomly.
       },
       'pretrain': {
           'method': 'hf',  # Method is one of 'hf', or 'direct_init'.
