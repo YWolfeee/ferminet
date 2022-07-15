@@ -358,7 +358,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
     mcmc_width_ckpt = None
 
   # Set up logging
-  train_schema = ['step', 'energy', 'ewmean', 'ewvar', 'pmove']
+  train_schema = ['step', 'energy', 'ewmean', 'ewvar', 'bth_var', 'pmove']
 
   # Initialisation done. We now want to have different PRNG streams on each
   # device. Shard the key over devices
